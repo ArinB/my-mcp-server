@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: mysql-mcp-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /mcp
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+
+      # Enter these securely in the Render dashboard / Blueprint setup.
+      - key: MCP_AUTH_TOKEN
+        sync: false
+      - key: MCP_BASE_URL
+        sync: false
+
+      - key: MYSQL_HOST
+        sync: false
+      - key: MYSQL_PORT
+        value: "3306"
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: MYSQL_DATABASE
+        sync: false
+
+      - key: MYSQL_SSL_DISABLED
+        value: "false"
+      - key: MYSQL_POOL_SIZE
+        value: "5"
+      - key: MYSQL_CONNECT_TIMEOUT
+        value: "10"
+      - key: MAX_RETURNED_ROWS
+        value: "500"
+
+      # Safer default. Change to "true" only if you need INSERT/UPDATE/DELETE.
+      - key: ENABLE_WRITES
+        value: "false"
