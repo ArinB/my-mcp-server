@@ -2,12 +2,13 @@ import hmac
 import os
 from typing import Any
 
+import uvicorn
 from dotenv import load_dotenv
-from pydantic import AnyHttpUrl
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from mcp.server import MCPServer
-from mcp.server.auth.provider import AccessToken, TokenVerifier
-from mcp.server.auth.settings import AuthSettings
 
 from db import (
     describe_table as db_describe_table,
@@ -19,15 +20,13 @@ from db import (
 
 load_dotenv()
 
-PORT = int(os.getenv("PORT", "10000"))
 HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "10000"))
 
-MCP_BASE_URL = os.getenv("MCP_BASE_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
-MCP_RESOURCE_URL = f"{MCP_BASE_URL}/mcp"
-
-# For a static bearer token, this is metadata only; the MCP server does not issue tokens.
-# If you later adopt Auth0/Entra/Keycloak/etc., point this to that authorization server.
-AUTH_ISSUER_URL = os.getenv("AUTH_ISSUER_URL", MCP_BASE_URL).rstrip("/") + "/"
+MCP_BASE_URL = os.getenv(
+    "MCP_BASE_URL",
+    f"http://127.0.0.1:{PORT}",
+).rstrip("/")
 
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
 ENABLE_WRITES = os.getenv("ENABLE_WRITES", "false").lower() == "true"
@@ -39,44 +38,57 @@ if len(MCP_AUTH_TOKEN) < 32:
     raise RuntimeError("MCP_AUTH_TOKEN must be at least 32 characters long.")
 
 
-class StaticTokenVerifier(TokenVerifier):
-    """Verify a single bearer token stored in the environment."""
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        if not hmac.compare_digest(token, MCP_AUTH_TOKEN):
-            return None
-
-        scopes = ["db:read"]
-        if ENABLE_WRITES:
-            scopes.append("db:write")
-
-        return AccessToken(
-            token=token,
-            client_id="static-mcp-client",
-            scopes=scopes,
-            resource=MCP_RESOURCE_URL,
-        )
+mcp = MCPServer("MySQL MCP Server")
 
 
-mcp = MCPServer(
-    "MySQL MCP Server",
-    token_verifier=StaticTokenVerifier(),
-    auth=AuthSettings(
-        issuer_url=AnyHttpUrl(AUTH_ISSUER_URL),
-        resource_server_url=AnyHttpUrl(MCP_RESOURCE_URL),
-        required_scopes=["db:read"],
-        validate_token_resource=True,
-    ),
-)
+class BearerTokenMiddleware(BaseHTTPMiddleware):
+    """
+    Protect the /mcp endpoint with a fixed Bearer token.
+
+    Expected request header:
+        Authorization: Bearer <MCP_AUTH_TOKEN>
+
+    This intentionally does NOT publish OAuth protected-resource metadata,
+    so clients are not directed into an OAuth sign-in flow.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        if request.url.path.startswith("/mcp"):
+            auth_header = request.headers.get("Authorization", "")
+
+            if not auth_header.startswith("Bearer "):
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+            supplied_token = auth_header[7:].strip()
+
+            if not supplied_token or not hmac.compare_digest(
+                supplied_token,
+                MCP_AUTH_TOKEN,
+            ):
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+        return await call_next(request)
 
 
 @mcp.tool()
 def server_status() -> dict[str, Any]:
     """Check MCP server and MySQL connectivity without exposing credentials."""
     db_ok, db_message = ping_database()
+
     return {
         "server": "MySQL MCP Server",
-        "mcp_resource_url": MCP_RESOURCE_URL,
+        "mcp_resource_url": f"{MCP_BASE_URL}/mcp",
         "database_connected": db_ok,
         "database_status": db_message,
         "writes_enabled": ENABLE_WRITES,
@@ -108,10 +120,10 @@ def query_database(
     """
     Run a read-only MySQL query.
 
-    Allowed statements: SELECT, SHOW, DESCRIBE, DESC, EXPLAIN, and read-only WITH queries.
-    Results are capped by MAX_RETURNED_ROWS.
+    Allowed statements are enforced by db.py.
 
     Use MySQL parameter placeholders (%s) and pass values in `parameters`.
+
     Example:
         sql = "SELECT * FROM customers WHERE customer_id = %s"
         parameters = [123]
@@ -132,9 +144,8 @@ def execute_database(
     Execute INSERT, UPDATE, or DELETE against MySQL.
 
     This tool works only when ENABLE_WRITES=true.
-    DDL statements such as DROP, ALTER, TRUNCATE, and CREATE are always rejected.
-
-    Use MySQL parameter placeholders (%s) and pass values in `parameters`.
+    DDL statements such as DROP, ALTER, TRUNCATE, and CREATE
+    are rejected by db.py.
 
     Args:
         sql: INSERT, UPDATE, or DELETE statement.
@@ -142,16 +153,20 @@ def execute_database(
     """
     if not ENABLE_WRITES:
         raise PermissionError(
-            "Database writes are disabled. Set ENABLE_WRITES=true in Render only if required."
+            "Database writes are disabled. "
+            "Set ENABLE_WRITES=true in Render only if required."
         )
 
     return execute_write(sql, parameters or [])
 
 
+app = mcp.streamable_http_app()
+app.add_middleware(BearerTokenMiddleware)
+
+
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
+    uvicorn.run(
+        app,
         host=HOST,
         port=PORT,
-        stateless_http=True,
     )
